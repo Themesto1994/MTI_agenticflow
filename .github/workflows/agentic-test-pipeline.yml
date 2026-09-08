@@ -84,6 +84,10 @@ on:
         description: "kane-cli/LambdaTest folder ID within the project (blank = account default)"
         required: false
         default: ""
+      start_url:
+        description: "Default start URL for test execution (e.g. https://example.com/login)"
+        required: false
+        default: ""
   workflow_call:
     inputs:
       requirements_doc:
@@ -107,6 +111,10 @@ on:
         required: false
         default: ""
       kane_folder_id:
+        type: string
+        required: false
+        default: ""
+      start_url:
         type: string
         required: false
         default: ""
@@ -225,8 +233,9 @@ jobs:
           fi
           kane-cli login "${args[@]}"
       - name: Set default start URL
+        if: ${{ inputs.start_url != '' }}
         run: |
-          kane-cli config set-url "https://practicetestautomation.com/practice-test-login/"
+          kane-cli config set-url "${{ inputs.start_url }}"
       - name: Select tests to author (respecting max_tests_to_author)
         id: select
         run: |
