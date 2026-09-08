@@ -1,0 +1,407 @@
+name: Agentic Test Pipeline
+
+# Generic, reusable 2-job pipeline - not tied to any specific requirements doc:
+#   1. planner              - read a requirements PDF/DOCX and generate/refresh test cases
+#                              (kane-cli generate), a separate job/runner from what follows.
+#   2. authoring-execution  - one job covering both remaining stages back to back, in the same
+#                              runner/workspace (no artifact hop between them):
+#       - authoring: author + export up to max_tests_to_author of the generated *_test.md files
+#                    as standalone Playwright code (kane-cli testmd run --code-export)
+#       - execution: re-run the same selected tests as one bundled LambdaTest test run
+#                    (kane-cli testrun run) and publish a job summary
+#
+# Authoring and execution were originally separate jobs, each re-doing checkout/setup-node/
+# install-kane-cli/login and shuttling an "authored-state" artifact between them just to carry
+# forward the local meta testrun needs. Merged into one job to drop that duplication - the
+# meta written by authoring's `testmd run` calls is already on disk when execution's
+# `testrun run` call runs right after, in the same workspace.
+#
+# Note on execution: it re-runs the *_test.md files via `kane-cli testrun run` rather than
+# executing the exported Playwright file directly (e.g. `node test.js`). The exported file
+# hardcodes the tcId/build from its authoring session, and replaying it standalone gets
+# rejected by LambdaTest with "Test case validation failed: bad request" - that combination is
+# only valid inside a fresh kane-cli-managed session, not a bare CDP replay. kane-cli's own
+# testmd/testrun commands create a new session each time and are the mechanism proven to
+# actually reach LambdaTest. `testrun run` additionally requires each member to already have
+# local meta from a prior `testmd run` (else it's skipped as "missing_meta") - satisfied here
+# simply by authoring's steps having already run earlier in the same job. IMPORTANT: unlike
+# `testmd run`, `testrun run` never returns a hosted LambdaTest dashboard link (public or
+# private) - only a local evidence pack - so the job summary reports pass/fail per test plus
+# that evidence pack (uploaded as an artifact), not a clickable Test Manager URL.
+#
+# kane_project_id / kane_folder_id inputs: passed to `kane-cli login --project-id/--folder-id`
+# in every job when set; left blank, kane-cli auto-selects the authenticated account's default
+# project/folder (same behavior as a plain `kane-cli login` with no such flags).
+#
+# Works two ways:
+#   - Directly in this repo: Actions tab > "Agentic Test Pipeline" > Run workflow, optionally
+#     overriding the inputs below (leave requirements_doc blank to auto-detect the first
+#     PDF/DOCX found in the repo root).
+#   - As a reusable workflow from another workflow in this repo (or any repo that checks this
+#     one out), e.g.:
+#
+#       jobs:
+#         tests:
+#           uses: <owner>/MTI_agenticflow/.github/workflows/agentic-test-pipeline.yml@master
+#           with:
+#             requirements_doc: Login_Flow_PRD.pdf
+#           secrets: inherit
+#
+# Required secrets (repo Settings > Secrets and variables > Actions, or passed via `secrets: inherit`):
+#   KANE_USERNAME, KANE_ACCESS_KEY   - kane-cli basic-auth credentials (same as `kane-cli login`)
+#   LT_USERNAME, LT_ACCESS_KEY       - LambdaTest credentials used by the exported code
+#
+# Manual-only by default (planner/authoring call a paid AI generation API) - add a push/PR
+# trigger once you're happy with the cost profile for a given repo.
+
+on:
+  workflow_dispatch:
+    inputs:
+      requirements_doc:
+        description: "Path to the requirements PDF/DOCX (blank = auto-detect first one in repo root)"
+        required: false
+        default: ""
+      generation_objective:
+        description: "Instruction passed to kane-cli generate"
+        required: false
+        default: "generate test cases for the requirements in the attached document, covering positive, negative, and edge cases for each functional requirement, also make sure the URL, and rest details like username, password etc are correctly given to the test cases generated"
+      test_language:
+        description: "Language for the exported automation code"
+        required: false
+        default: "javascript"
+        type: choice
+        options:
+          - javascript
+          - python
+      max_tests_to_author:
+        description: "Cap on how many planner-generated tests get authored (0 = author all of them)"
+        required: false
+        default: 0
+        type: number
+      kane_project_id:
+        description: "kane-cli/LambdaTest project ID (blank = account default, same as a plain kane-cli login)"
+        required: false
+        default: ""
+      kane_folder_id:
+        description: "kane-cli/LambdaTest folder ID within the project (blank = account default)"
+        required: false
+        default: ""
+  workflow_call:
+    inputs:
+      requirements_doc:
+        type: string
+        required: false
+        default: ""
+      generation_objective:
+        type: string
+        required: false
+        default: "generate test cases for the requirements in the attached document, covering positive, negative, and edge cases for each functional requirement, also make sure the URL, and rest details like username, password etc are correctly given to the test cases generated"
+      test_language:
+        type: string
+        required: false
+        default: "javascript"
+      max_tests_to_author:
+        type: number
+        required: false
+        default: 0
+      kane_project_id:
+        type: string
+        required: false
+        default: ""
+      kane_folder_id:
+        type: string
+        required: false
+        default: ""
+    secrets:
+      KANE_USERNAME:
+        required: true
+      KANE_ACCESS_KEY:
+        required: true
+      LT_USERNAME:
+        required: true
+      LT_ACCESS_KEY:
+        required: true
+
+jobs:
+  planner:
+    name: Planner - Test Creation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install kane-cli
+        run: npm install -g @testmuai/kane-cli@latest
+
+      - name: Authenticate kane-cli
+        run: |
+          set -e
+          args=(--username "${{ secrets.KANE_USERNAME }}" --access-key "${{ secrets.KANE_ACCESS_KEY }}")
+          # Blank project/folder ID = let kane-cli auto-select the account default (same
+          # as a plain `kane-cli login` with no --project-id/--folder-id).
+          if [ -n "${{ inputs.kane_project_id }}" ]; then
+            args+=(--project-id "${{ inputs.kane_project_id }}")
+          fi
+          if [ -n "${{ inputs.kane_folder_id }}" ]; then
+            args+=(--folder-id "${{ inputs.kane_folder_id }}")
+          fi
+          kane-cli login "${args[@]}"
+
+      - name: Resolve requirements document
+        id: resolve
+        run: |
+          doc="${{ inputs.requirements_doc }}"
+          if [ -z "$doc" ]; then
+            doc=$(find . -maxdepth 2 \( -iname '*.pdf' -o -iname '*.docx' \) | head -n1)
+          fi
+          if [ -z "$doc" ]; then
+            echo "::error::No requirements_doc input given and no PDF/DOCX found in repo root." >&2
+            exit 1
+          fi
+          if [ ! -f "$doc" ]; then
+            echo "::error::requirements_doc '$doc' is not a file in the checked-out repo. Pass a path relative to the repo root (e.g. 'Login_Flow_PRD.pdf'), not a github.com URL." >&2
+            exit 1
+          fi
+          echo "Using requirements document: $doc"
+          echo "doc=$doc" >> "$GITHUB_OUTPUT"
+
+      - name: Generate test cases from requirements document
+        id: generate
+        run: |
+          set -e -o pipefail
+          output=$(kane-cli generate "${{ inputs.generation_objective }}" \
+            --files "${{ steps.resolve.outputs.doc }}" \
+            --agent | tee /dev/stderr)
+          req_id=$(printf '%s\n' "$output" | grep '"type":"generate_done"' | grep -o '"request_id":"[0-9]*"' | grep -o '[0-9]*' | tail -n1)
+          if [ -z "$req_id" ]; then
+            echo "::error::Could not find a request_id in kane-cli generate output." >&2
+            exit 1
+          fi
+          echo "Generated request id: $req_id"
+          echo "request_id=$req_id" >> "$GITHUB_OUTPUT"
+
+      - name: Save generated test cases
+        run: |
+          kane-cli generate --save --req "${{ steps.generate.outputs.request_id }}" --agent
+
+      - name: Upload generated test suite
+        uses: actions/upload-artifact@v4
+        with:
+          name: generated-tests
+          path: .testmuai/tests/**/*_test.md
+          retention-days: 14
+
+      - name: Publish planner summary
+        if: always()
+        run: |
+          {
+            echo "## Planner - Test Creation Summary"
+            echo
+            echo "**Requirements document:** \`${{ steps.resolve.outputs.doc }}\`  "
+            echo "**kane-cli request ID:** \`${{ steps.generate.outputs.request_id }}\`"
+            echo
+            echo "Generated \`*_test.md\` files are uploaded as the \`generated-tests\` artifact on this run."
+            echo
+            echo "> A test case only gets a LambdaTest Test Manager link once it's authored/run in the next job - nothing to link to yet at this stage. See the authoring-execution job summary for Test Manager links."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  authoring-execution:
+    name: Authoring & Execution - Author, Export, Run on LambdaTest
+    needs: planner
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: generated-tests
+          path: .testmuai/tests
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install kane-cli
+        run: npm install -g @testmuai/kane-cli@latest
+
+      - name: Authenticate kane-cli
+        run: |
+          set -e
+          args=(--username "${{ secrets.KANE_USERNAME }}" --access-key "${{ secrets.KANE_ACCESS_KEY }}")
+          # Blank project/folder ID = let kane-cli auto-select the account default (same
+          # as a plain `kane-cli login` with no --project-id/--folder-id).
+          if [ -n "${{ inputs.kane_project_id }}" ]; then
+            args+=(--project-id "${{ inputs.kane_project_id }}")
+          fi
+          if [ -n "${{ inputs.kane_folder_id }}" ]; then
+            args+=(--folder-id "${{ inputs.kane_folder_id }}")
+          fi
+          kane-cli login "${args[@]}"
+
+      - name: Select tests to author (respecting max_tests_to_author)
+        id: select
+        run: |
+          set -e
+          mapfile -d '' -t all_tests < <(find .testmuai/tests -name '*_test.md' -print0 | sort -z)
+          total=${#all_tests[@]}
+          max="${{ inputs.max_tests_to_author }}"
+          if [ -n "$max" ] && [ "$max" -gt 0 ] && [ "$max" -lt "$total" ]; then
+            echo "Planner produced $total tests; authoring is capped at $max."
+            selected=("${all_tests[@]:0:$max}")
+          else
+            echo "Planner produced $total tests; authoring all of them (no cap, or cap >= total)."
+            selected=("${all_tests[@]}")
+          fi
+          printf '%s\0' "${selected[@]}" > selected_tests.txt
+          echo "count=${#selected[@]}" >> "$GITHUB_OUTPUT"
+
+      - name: Sync selected tests to TMS and export their automation code
+        env:
+          LT_USERNAME: ${{ secrets.LT_USERNAME }}
+          LT_ACCESS_KEY: ${{ secrets.LT_ACCESS_KEY }}
+        run: |
+          set -e
+          echo "Authoring ${{ steps.select.outputs.count }} test(s)."
+          failed_count=0
+          : > authoring_links.tsv
+          while IFS= read -r -d '' test_file; do
+            echo "Running + exporting: $test_file"
+            test_out=$(mktemp)
+            # A failed assertion/replay still syncs the test and exports its code
+            # (kane-cli just exits non-zero to report the failure) - don't let a
+            # single failing test abort authoring for the rest of the suite. Bare
+            # pipeline (no pipefail) so `set -e` sees tee's exit status, not
+            # kane-cli's - failure handling happens explicitly via PIPESTATUS below.
+            kane-cli testmd run "$test_file" \
+              --headless \
+              --agent \
+              --code-export \
+              --code-language "${{ inputs.test_language }}" | tee "$test_out"
+            run_status=${PIPESTATUS[0]}
+            if [ "$run_status" -ne 0 ]; then
+              echo "::warning::Test failed (assertions or replay) but code was still exported: $test_file"
+              failed_count=$((failed_count + 1))
+            fi
+            # test_md_done/test_md_summary carry a public share_url when upload succeeded;
+            # the private (login-required) equivalent is the same URL with everything from
+            # /dashboard/share/ onward stripped off.
+            share_url=$(grep -o '"share_url":"[^"]*"' "$test_out" | tail -n1 | sed -E 's/.*:"(.*)"/\1/')
+            testcase_id=$(grep -o '"testcase_id":"[^"]*"' "$test_out" | tail -n1 | sed -E 's/.*:"(.*)"/\1/')
+            private_url=""
+            if [ -n "$share_url" ]; then
+              private_url="${share_url%%/dashboard/share/*}"
+            fi
+            printf '%s\t%s\t%s\t%s\n' "$test_file" "${testcase_id:-N/A}" "${share_url:-N/A}" "${private_url:-N/A}" >> authoring_links.tsv
+            rm -f "$test_out"
+          done < selected_tests.txt
+          if [ "$failed_count" -gt 0 ]; then
+            echo "$failed_count of ${{ steps.select.outputs.count }} test(s) failed during authoring (code was exported for all of them regardless)."
+          fi
+
+      - name: Upload exported automation code
+        uses: actions/upload-artifact@v4
+        with:
+          name: automation-code
+          path: .testmuai/tests/**/playwright-${{ inputs.test_language }}-code/**
+          retention-days: 14
+
+      - name: Publish authoring summary
+        if: always()
+        run: |
+          {
+            echo "## Authoring - Automation Code Generation Summary"
+            echo
+            echo "Exported automation code (\`${{ inputs.test_language }}\`) is uploaded as the \`automation-code\` artifact on this run."
+            echo
+            echo "| Test | Test Manager (public) | Test Manager (private, login required) |"
+            echo "|---|---|---|"
+            if [ -f authoring_links.tsv ]; then
+              while IFS=$'\t' read -r path testcase_id share_url private_url; do
+                name=$(basename "$path")
+                if [ "$share_url" = "N/A" ]; then
+                  echo "| $name | N/A | N/A |"
+                else
+                  echo "| $name | [open]($share_url) | [open]($private_url) |"
+                fi
+              done < authoring_links.tsv
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run selected tests as one LambdaTest test run
+        # kane-cli testrun run bundles every listed test into a single sealed execution
+        # (one LambdaTest Test Run / evidence pack), instead of N separate ad-hoc sessions.
+        # Its NDJSON output never includes a hosted LambdaTest share/dashboard URL (public or
+        # private) - only a local evidence_id, viewable via `kane-cli evidence serve`. Captured
+        # here (not `set -e`'d away on failure) so the summary step below can still parse and
+        # publish results even when one or more tests fail.
+        env:
+          LT_USERNAME: ${{ secrets.LT_USERNAME }}
+          LT_ACCESS_KEY: ${{ secrets.LT_ACCESS_KEY }}
+        run: |
+          mapfile -d '' -t test_files < selected_tests.txt
+          echo "Running ${#test_files[@]} test(s) as one test run."
+          kane-cli testrun run "${test_files[@]}" \
+            --headless \
+            --on-failure continue \
+            --name "agentic-test-pipeline run ${{ github.run_id }}" | tee testrun_output.ndjson
+          exit_code=${PIPESTATUS[0]}
+          if [ "$exit_code" -ne 0 ]; then
+            echo "::warning::One or more tests failed in the test run - see the job summary for per-test status."
+          fi
+
+      - name: Locate evidence pack for upload
+        if: always()
+        id: evidence
+        run: |
+          execution_id=$(jq -r 'select(.type == "testrun_done") | .execution_id' testrun_output.ndjson | tail -n1)
+          echo "execution_id=$execution_id" >> "$GITHUB_OUTPUT"
+          pack=".testmuai/evidence/$execution_id.evidence"
+          if [ -f "$pack" ]; then
+            mkdir -p evidence-pack
+            cp "$pack" evidence-pack/
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload evidence pack
+        if: always() && steps.evidence.outputs.found == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-run-evidence
+          path: evidence-pack/*.evidence
+          retention-days: 14
+
+      - name: Publish summary
+        if: always()
+        run: |
+          {
+            echo "## Agentic Test Pipeline - Execution Summary"
+            echo
+            project="${{ inputs.kane_project_id }}"
+            folder="${{ inputs.kane_folder_id }}"
+            echo "**Project:** ${project:-account default}  "
+            echo "**Folder:** ${folder:-account default}  "
+            echo "**Execution ID:** ${{ steps.evidence.outputs.execution_id }}"
+            echo
+            echo "| Test | Status | Duration (s) |"
+            echo "|---|---|---|"
+            jq -r 'select(.type == "testrun_member_end") | "| \(.path | split("/") | last) | \(.status) | \(.duration_s) |"' testrun_output.ndjson
+            echo
+            jq -r 'select(.type == "testrun_summary") | "**Totals:** \(.totals.passed) passed, \(.totals.failed) failed, \(.totals.broken) broken, \(.totals.skipped) skipped (of \(.totals.tests)) - \(.duration_s)s"' testrun_output.ndjson
+            jq -r 'select(.type == "testrun_done") | "**Overall status:** \(.overall_status)"' testrun_output.ndjson
+            echo
+            if [ "${{ steps.evidence.outputs.found }}" = "true" ]; then
+              echo "**Evidence pack:** uploaded as the \`test-run-evidence\` artifact on this run. Download it and view locally with:"
+              echo '```'
+              echo "kane-cli evidence serve <downloaded-file>.evidence"
+              echo '```'
+            else
+              echo "**Evidence pack:** not found on this runner (upload may have failed or not completed)."
+            fi
+            echo
+            echo "> **Note:** \`kane-cli testrun run\` does not produce a hosted LambdaTest Test Manager link (public or private) - only the local evidence pack above. Per-test dashboard share links require running via \`kane-cli testmd run\` per test instead of the grouped test run."
+          } >> "$GITHUB_STEP_SUMMARY"

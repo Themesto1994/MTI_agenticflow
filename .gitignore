@@ -1,0 +1,30 @@
+# Dependencies
+node_modules/
+
+# Environment / secrets
+.env
+.env.local
+*.env
+!.env.example
+
+# OS
+.DS_Store
+
+# Logs
+*.log
+npm-debug.log*
+
+# Playwright
+test-results/
+playwright-report/
+blob-report/
+playwright/.cache/
+
+# kane-cli / testmu run artifacts (regenerable evidence, screenshots, videos)
+.testmuai/**/*.evidence
+.testmuai/**/output-*/.internal/
+.testmuai/evidence/
+
+# Editor
+.vscode/
+.idea/

@@ -1,0 +1,4 @@
+- [Test-case generation flow](testcase_generation_flow.md) — read doc → kane-cli generate → refine for gaps → flag open questions → table → save; default for all test-creating requests
+- [Login flow suite](login_flow_suite.md) — kane-cli req id (populated after first run), suite path .testmuai/tests/login-flow-<req_id>/, covers positive/negative/edge login scenarios
+- [Mirror memory to repo](mirror_memory_to_repo.md) — always copy memory/ writes into MTI_agenticflow/.claude-memory/ so they're visible in the IDE tree
+- [Agentic test pipeline workflow](agentic_test_pipeline_workflow.md) — reusable planner/authoring/execution GH Action, inputs, and required (not-yet-added) secrets
