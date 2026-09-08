@@ -1,5 +1,4 @@
 name: Agentic Test Pipeline
-
 # Generic, reusable 2-job pipeline - not tied to any specific requirements doc:
 #   1. planner              - read a requirements PDF/DOCX and generate/refresh test cases
 #                              (kane-cli generate), a separate job/runner from what follows.
@@ -53,7 +52,6 @@ name: Agentic Test Pipeline
 #
 # Manual-only by default (planner/authoring call a paid AI generation API) - add a push/PR
 # trigger once you're happy with the cost profile for a given repo.
-
 on:
   workflow_dispatch:
     inputs:
@@ -95,7 +93,7 @@ on:
       generation_objective:
         type: string
         required: false
-        default: "generate test cases for the requirements in the attached document, covering positive, negative, and edge cases for each functional requirement, also make sure the URL, and rest details like username, password etc are correctly given to the test cases generated"
+        default: "generate test cases for the requirements in the attached document, covering positive, negative, and edge cases for each functional requirement"
       test_language:
         type: string
         required: false
@@ -121,21 +119,17 @@ on:
         required: true
       LT_ACCESS_KEY:
         required: true
-
 jobs:
   planner:
     name: Planner - Test Creation
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-
       - name: Install kane-cli
         run: npm install -g @testmuai/kane-cli@latest
-
       - name: Authenticate kane-cli
         run: |
           set -e
@@ -149,7 +143,6 @@ jobs:
             args+=(--folder-id "${{ inputs.kane_folder_id }}")
           fi
           kane-cli login "${args[@]}"
-
       - name: Resolve requirements document
         id: resolve
         run: |
@@ -167,7 +160,6 @@ jobs:
           fi
           echo "Using requirements document: $doc"
           echo "doc=$doc" >> "$GITHUB_OUTPUT"
-
       - name: Generate test cases from requirements document
         id: generate
         run: |
@@ -182,18 +174,15 @@ jobs:
           fi
           echo "Generated request id: $req_id"
           echo "request_id=$req_id" >> "$GITHUB_OUTPUT"
-
       - name: Save generated test cases
         run: |
           kane-cli generate --save --req "${{ steps.generate.outputs.request_id }}" --agent
-
       - name: Upload generated test suite
         uses: actions/upload-artifact@v4
         with:
           name: generated-tests
           path: .testmuai/tests/**/*_test.md
           retention-days: 14
-
       - name: Publish planner summary
         if: always()
         run: |
@@ -207,26 +196,21 @@ jobs:
             echo
             echo "> A test case only gets a LambdaTest Test Manager link once it's authored/run in the next job - nothing to link to yet at this stage. See the authoring-execution job summary for Test Manager links."
           } >> "$GITHUB_STEP_SUMMARY"
-
   authoring-execution:
     name: Authoring & Execution - Author, Export, Run on LambdaTest
     needs: planner
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/download-artifact@v4
         with:
           name: generated-tests
           path: .testmuai/tests
-
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-
       - name: Install kane-cli
         run: npm install -g @testmuai/kane-cli@latest
-
       - name: Authenticate kane-cli
         run: |
           set -e
@@ -240,7 +224,9 @@ jobs:
             args+=(--folder-id "${{ inputs.kane_folder_id }}")
           fi
           kane-cli login "${args[@]}"
-
+      - name: Set default start URL
+        run: |
+          kane-cli config set-url "https://practicetestautomation.com/practice-test-login/"
       - name: Select tests to author (respecting max_tests_to_author)
         id: select
         run: |
@@ -257,7 +243,6 @@ jobs:
           fi
           printf '%s\0' "${selected[@]}" > selected_tests.txt
           echo "count=${#selected[@]}" >> "$GITHUB_OUTPUT"
-
       - name: Sync selected tests to TMS and export their automation code
         env:
           LT_USERNAME: ${{ secrets.LT_USERNAME }}
@@ -300,14 +285,12 @@ jobs:
           if [ "$failed_count" -gt 0 ]; then
             echo "$failed_count of ${{ steps.select.outputs.count }} test(s) failed during authoring (code was exported for all of them regardless)."
           fi
-
       - name: Upload exported automation code
         uses: actions/upload-artifact@v4
         with:
           name: automation-code
           path: .testmuai/tests/**/playwright-${{ inputs.test_language }}-code/**
           retention-days: 14
-
       - name: Publish authoring summary
         if: always()
         run: |
@@ -329,7 +312,6 @@ jobs:
               done < authoring_links.tsv
             fi
           } >> "$GITHUB_STEP_SUMMARY"
-
       - name: Run selected tests as one LambdaTest test run
         # kane-cli testrun run bundles every listed test into a single sealed execution
         # (one LambdaTest Test Run / evidence pack), instead of N separate ad-hoc sessions.
@@ -351,7 +333,6 @@ jobs:
           if [ "$exit_code" -ne 0 ]; then
             echo "::warning::One or more tests failed in the test run - see the job summary for per-test status."
           fi
-
       - name: Locate evidence pack for upload
         if: always()
         id: evidence
@@ -366,7 +347,6 @@ jobs:
           else
             echo "found=false" >> "$GITHUB_OUTPUT"
           fi
-
       - name: Upload evidence pack
         if: always() && steps.evidence.outputs.found == 'true'
         uses: actions/upload-artifact@v4
@@ -374,7 +354,6 @@ jobs:
           name: test-run-evidence
           path: evidence-pack/*.evidence
           retention-days: 14
-
       - name: Publish summary
         if: always()
         run: |
