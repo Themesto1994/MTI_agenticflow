@@ -64,7 +64,7 @@ on:
       generation_objective:
         description: "Instruction passed to kane-cli generate"
         required: false
-        default: "generate test cases for the requirements in the attached document, covering positive, negative, and edge cases for each functional requirement, also make sure the URL, and rest details like username, password etc are correctly given to the test cases generated"
+        default: "generate test cases for the requirements in the attached document, covering positive, negative, and edge cases for each functional requirement"
       test_language:
         description: "Language for the exported automation code"
         required: false
